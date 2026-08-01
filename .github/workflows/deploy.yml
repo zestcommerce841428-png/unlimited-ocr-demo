@@ -1,0 +1,58 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-hf-space
+  cancel-in-progress: true
+
+env:
+  HF_SPACE: zestcommerce841428/unlimited-ocr-demo
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend (static export)
+        working-directory: frontend
+        run: npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Hugging Face CLI
+        run: pip install -U huggingface_hub
+
+      - name: Sanity-check backend before deploying
+        run: python -m py_compile app.py
+
+      - name: Assemble deploy payload (built frontend -> static/)
+        run: |
+          rm -rf static
+          cp -r frontend/out static
+
+      - name: Push to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          hf upload "$HF_SPACE" app.py app.py --repo-type space --token "$HF_TOKEN"
+          hf upload "$HF_SPACE" requirements.txt requirements.txt --repo-type space --token "$HF_TOKEN"
+          hf upload "$HF_SPACE" packages.txt packages.txt --repo-type space --token "$HF_TOKEN"
+          hf upload "$HF_SPACE" README.md README.md --repo-type space --token "$HF_TOKEN"
+          hf upload "$HF_SPACE" static static --repo-type space --token "$HF_TOKEN"

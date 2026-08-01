@@ -110,6 +110,28 @@ def _office_to_pdf(path: str) -> str:
     return pdf_path
 
 
+def _normalize_upload_path(document) -> str:
+    """Ensures the returned path has a real extension to route on.
+
+    `@app.api` FileData uploads store the file under an upload-cache path
+    that doesn't always preserve the original extension, unlike Blocks
+    components' `filepath` values. `orig_name` (the real uploaded filename)
+    is the reliable source for what kind of file this actually is.
+    """
+    if not isinstance(document, dict):
+        return document
+    path = document.get("path")
+    orig_name = document.get("orig_name") or ""
+    if os.path.splitext(path)[1]:
+        return path
+    orig_ext = os.path.splitext(orig_name)[1]
+    if not orig_ext:
+        return path
+    normalized = f"{path}{orig_ext}"
+    shutil.copyfile(path, normalized)
+    return normalized
+
+
 def _file_to_pages(path: str, max_pages: int = MAX_DEMO_PAGES):
     """Turns any supported upload into a list of page-image paths."""
     ext = os.path.splitext(path)[1].lower()
@@ -209,21 +231,53 @@ def _run_streaming(target_fn, **kwargs):
     yield accumulated
 
 
-def _document_duration(path, mode, prompt):
+def _document_duration(document, mode, prompt):
     # ZeroGPU appears to apply its own safety margin on top of whatever is
     # returned here before checking it against the visitor's tier cap (a
     # 280s return was rejected as "420s" — a suspiciously exact 1.5x), so
-    # these are kept well under the free-tier per-call ceiling.
-    if not path:
-        return 60
-    ext = os.path.splitext(path)[1].lower()
-    if ext in IMAGE_EXTS:
-        return 60 if mode == "gundam" else 120
-    return 150  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
+    # these are kept well under the free-tier per-call ceiling. Use orig_name
+    # (the real uploaded filename) rather than `path` (an upload-cache path
+    # that may not preserve the extension) to detect the file type, and
+    # never let a detection quirk request an oversized duration.
+    try:
+        name = ""
+        if isinstance(document, dict):
+            name = document.get("orig_name") or document.get("path") or ""
+        elif document:
+            name = str(document)
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTS:
+            return 45 if mode == "gundam" else 90
+        return 110  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
+    except Exception:
+        return 45
 
 
+# ── Server: custom Next.js frontend + JSON/SSE API ──────────────────────────────
+
+app = Server(title="Unlimited-OCR Demo")
+
+
+# `@app.api` must be the outer decorator for the endpoint to be recognized as
+# a streaming generator — splitting @spaces.GPU onto a separate function that
+# this one `yield from`s (the pattern the skill doc recommends in general)
+# made Gradio's schema introspection report this endpoint as non-streaming
+# (`generator: false`) and silently drop every yielded value. Stacking them
+# directly, as the model's own official reference Space does, is what
+# actually works here.
+@app.api(name="run_document", stream_every=0.15, time_limit=200)
 @spaces.GPU(duration=_document_duration)
-def _run_document_gpu(path: str, mode: str, prompt: str) -> Iterator[dict]:
+def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "") -> Iterator[dict]:
+    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR.
+
+    Args:
+        document: the uploaded file — an image, PDF, or Office document.
+        mode: 'gundam' (fast, crops the page) or 'base' (accurate, full page).
+            Only affects single-page results.
+        prompt: OCR instruction, e.g. 'document parsing.', 'Free OCR.', or a
+            custom prompt. Empty defaults to document parsing.
+    """
+    path = _normalize_upload_path(document)
     pages = _file_to_pages(path)
     if not pages:
         raise gr.Error("Could not read any pages from that file.")
@@ -266,30 +320,6 @@ def _run_document_gpu(path: str, mode: str, prompt: str) -> Iterator[dict]:
     text = _read_result_text(out_dir) or final_text
     yield {"text": text, "boxes": _collect_boxes_data_urls(out_dir)}
 
-
-# ── Server: custom Next.js frontend + JSON/SSE API ──────────────────────────────
-
-app = Server(title="Unlimited-OCR Demo")
-
-
-@app.api(name="run_document", stream_every=0.15, time_limit=200)
-def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "") -> Iterator[dict]:
-    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR.
-
-    Args:
-        document: the uploaded file — an image, PDF, or Office document.
-        mode: 'gundam' (fast, crops the page) or 'base' (accurate, full page).
-            Only affects single-page results.
-        prompt: OCR instruction, e.g. 'document parsing.', 'Free OCR.', or a
-            custom prompt. Empty defaults to document parsing.
-    """
-    path = document["path"] if isinstance(document, dict) else document
-    yield from _run_document_gpu(path, mode, prompt)
-
-
-# `@spaces.GPU` doesn't stack with `@app.api` on the same function, so
-# `_run_document_gpu` (decorated above) does the GPU work and this thin
-# wrapper is what's actually exposed as an endpoint — see gr.Server docs.
 
 app.mount("/_next", StaticFiles(directory=os.path.join(STATIC_DIR, "_next")), name="next-assets")
 app.mount("/examples", StaticFiles(directory=os.path.join(STATIC_DIR, "examples")), name="examples")
