@@ -16,21 +16,27 @@ subprocess.run(
     check=True,
 )
 
+import base64
 import glob
 import os
 import queue
 import shutil
 import tempfile
 import threading
+from typing import Iterator
 
 import spaces  # noqa: E402  (must precede torch / transformers imports)
 import torch
 from transformers import AutoModel, AutoTokenizer
 
 import gradio as gr
+from gradio import Server
+from gradio.data_classes import FileData
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 MODEL_NAME = "baidu/Unlimited-OCR"
-EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -48,16 +54,8 @@ model = (
 print("Model ready.")
 
 MODES = {
-    "Gundam — fast": dict(base_size=1024, image_size=640, crop_mode=True),
-    "Base — accurate": dict(base_size=1024, image_size=1024, crop_mode=False),
-}
-MODE_INFO = "Applies to single-page results. Gundam crops the page into tiles for speed; Base processes the full page for the highest fidelity."
-
-PROMPT_PRESETS = {
-    "Document parsing": "document parsing.",
-    "Free OCR": "Free OCR.",
-    "Parse the figure": "Parse the figure.",
-    "Layout grounding": "<|grounding|>Given the layout of the image. ",
+    "gundam": dict(base_size=1024, image_size=640, crop_mode=True),
+    "base": dict(base_size=1024, image_size=1024, crop_mode=False),
 }
 
 MAX_DEMO_PAGES = 4  # keep multi-page runs inside a shared ZeroGPU quota
@@ -65,12 +63,6 @@ MAX_DEMO_PAGES = 4  # keep multi-page runs inside a shared ZeroGPU quota
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 OFFICE_EXTS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".odp", ".ods", ".rtf", ".txt", ".csv"}
 PDF_EXT = ".pdf"
-
-SUPPORTED_FILE_TYPES = [
-    "image",
-    PDF_EXT,
-    *sorted(OFFICE_EXTS),
-]
 
 
 # ── File → page-image conversion ────────────────────────────────────────────────
@@ -143,11 +135,21 @@ def _read_result_text(out_dir: str) -> str:
     return ""
 
 
-def _collect_boxes_images(out_dir: str):
+def _collect_boxes_data_urls(out_dir: str):
+    """Reads any result_with_boxes*.jpg files and inlines them as data URLs.
+
+    Returning data URLs (rather than server-side paths) sidesteps Gradio's
+    file-serving allowed-paths check entirely, since these images live in an
+    ad-hoc tempdir outside the app's static/ directory.
+    """
     single = os.path.join(out_dir, "result_with_boxes.jpg")
-    if os.path.exists(single):
-        return [single]
-    return sorted(glob.glob(os.path.join(out_dir, "result_with_boxes_*.jpg")))
+    paths = [single] if os.path.exists(single) else sorted(glob.glob(os.path.join(out_dir, "result_with_boxes_*.jpg")))
+    urls = []
+    for p in paths:
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        urls.append(f"data:image/jpeg;base64,{b64}")
+    return urls
 
 
 class _StreamTap:
@@ -207,50 +209,45 @@ def _run_streaming(target_fn, **kwargs):
     yield accumulated
 
 
-def _document_duration(file, mode_label, prompt_preset, custom_prompt):
+def _document_duration(path, mode, prompt):
     # ZeroGPU appears to apply its own safety margin on top of whatever is
     # returned here before checking it against the visitor's tier cap (a
     # 280s return was rejected as "420s" — a suspiciously exact 1.5x), so
     # these are kept well under the free-tier per-call ceiling.
-    if not file:
+    if not path:
         return 60
-    ext = os.path.splitext(file)[1].lower()
+    ext = os.path.splitext(path)[1].lower()
     if ext in IMAGE_EXTS:
-        return 60 if mode_label.startswith("Gundam") else 120
+        return 60 if mode == "gundam" else 120
     return 150  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
 
 
 @spaces.GPU(duration=_document_duration)
-def run_document(file, mode_label, prompt_preset, custom_prompt):
-    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR."""
-    if not file:
-        raise gr.Error("Upload a file first.")
-
-    pages = _file_to_pages(file)
+def _run_document_gpu(path: str, mode: str, prompt: str) -> Iterator[dict]:
+    pages = _file_to_pages(path)
     if not pages:
         raise gr.Error("Could not read any pages from that file.")
 
-    prompt = (custom_prompt or "").strip()
+    prompt = (prompt or "").strip()
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
 
     if len(pages) == 1:
-        prompt = prompt or PROMPT_PRESETS[prompt_preset]
+        resolved_prompt = prompt or "document parsing."
         infer_kwargs = dict(
-            prompt=f"<image>{prompt}",
+            prompt=f"<image>{resolved_prompt}",
             image_file=pages[0],
             output_path=out_dir,
             max_length=8192,
             no_repeat_ngram_size=35,
             ngram_window=128,
             save_results=True,
-            **MODES[mode_label],
+            **MODES.get(mode, MODES["gundam"]),
         )
         target_fn = model.infer
     else:
-        if not prompt:
-            prompt = "Multi page parsing." if prompt_preset == "Document parsing" else PROMPT_PRESETS[prompt_preset]
+        resolved_prompt = prompt if prompt and prompt.lower() != "document parsing." else "Multi page parsing."
         infer_kwargs = dict(
-            prompt=f"<image>{prompt}",
+            prompt=f"<image>{resolved_prompt}",
             image_files=pages,
             output_path=out_dir,
             image_size=1024,
@@ -264,156 +261,50 @@ def run_document(file, mode_label, prompt_preset, custom_prompt):
     final_text = ""
     for accumulated in _run_streaming(target_fn, **infer_kwargs):
         final_text = accumulated
-        yield accumulated, accumulated, None
+        yield {"text": accumulated, "boxes": []}
 
     text = _read_result_text(out_dir) or final_text
-    boxes = _collect_boxes_images(out_dir)
-    yield text, text, (boxes or None)
+    yield {"text": text, "boxes": _collect_boxes_data_urls(out_dir)}
 
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
+# ── Server: custom Next.js frontend + JSON/SSE API ──────────────────────────────
 
-THEME = gr.themes.Soft(
-    primary_hue=gr.themes.colors.blue,
-    secondary_hue=gr.themes.colors.indigo,
-    neutral_hue=gr.themes.colors.slate,
-    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
-    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
-).set(
-    button_primary_background_fill="*primary_600",
-    button_primary_background_fill_hover="*primary_700",
-    block_shadow="0 1px 3px rgba(0,0,0,0.06)",
-    block_radius="16px",
-)
+app = Server(title="Unlimited-OCR Demo")
 
-CSS = """
-.gradio-container {max-width: 1180px !important; margin: 0 auto !important;}
-#hero {text-align: center; padding: 8px 0 4px 0;}
-#hero h1 {font-size: 1.9rem; margin-bottom: 0.25rem;}
-#hero p {color: var(--body-text-color-subdued); font-size: 1.02rem; margin-top: 0;}
-#badges {display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px 0;}
-#badges a {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 12px; border-radius: 999px; font-size: 0.82rem; font-weight: 500;
-    text-decoration: none; border: 1px solid var(--border-color-primary);
-    color: var(--body-text-color); background: var(--background-fill-secondary);
-}
-#badges a:hover {background: var(--background-fill-primary); border-color: var(--primary-500);}
-#footer {text-align: center; color: var(--body-text-color-subdued); font-size: 0.85rem; margin-top: 18px;}
-#footer a {color: var(--primary-600);}
-.result-panel textarea, .result-panel .prose {font-size: 0.92rem;}
-"""
 
-HERO_HTML = f"""
-<div id="hero">
-  <h1>🔎 Unlimited-OCR</h1>
-  <p>One-shot, long-horizon document parsing — powered by
-  <a href="https://huggingface.co/{MODEL_NAME}" target="_blank">{MODEL_NAME}</a></p>
-</div>
-<div id="badges">
-  <a href="https://huggingface.co/{MODEL_NAME}" target="_blank">🤗 Model card</a>
-  <a href="https://github.com/baidu/Unlimited-OCR" target="_blank">⚙️ GitHub</a>
-  <a href="https://arxiv.org/abs/2606.23050" target="_blank">📄 Paper</a>
-  <a href="https://huggingface.co/{MODEL_NAME}/blob/main/LICENSE" target="_blank">⚖️ MIT License</a>
-</div>
-"""
+@app.api(name="run_document", stream_every=0.15, time_limit=200)
+def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "") -> Iterator[dict]:
+    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR.
 
-FOOTER_HTML = f"""
-<div id="footer">
-  Built with 🤗 <a href="https://gradio.app" target="_blank">Gradio</a> on
-  <a href="https://huggingface.co/spaces" target="_blank">Hugging Face Spaces</a> · Runs on ZeroGPU ·
-  Model by <a href="https://huggingface.co/baidu" target="_blank">Baidu</a>, released under MIT.
-</div>
-"""
+    Args:
+        document: the uploaded file — an image, PDF, or Office document.
+        mode: 'gundam' (fast, crops the page) or 'base' (accurate, full page).
+            Only affects single-page results.
+        prompt: OCR instruction, e.g. 'document parsing.', 'Free OCR.', or a
+            custom prompt. Empty defaults to document parsing.
+    """
+    path = document["path"] if isinstance(document, dict) else document
+    yield from _run_document_gpu(path, mode, prompt)
 
-EXAMPLES_SINGLE = [
-    [os.path.join(EXAMPLES_DIR, "invoice.png"), "Gundam — fast", "Document parsing"],
-    [os.path.join(EXAMPLES_DIR, "report.png"), "Base — accurate", "Document parsing"],
-    [os.path.join(EXAMPLES_DIR, "invoice.png"), "Gundam — fast", "Layout grounding"],
-]
 
-with gr.Blocks(title="Unlimited-OCR Demo") as demo:
-    gr.HTML(HERO_HTML)
-    gr.Markdown(
-        f"Upload an **image** (JPG/PNG/WEBP/BMP/TIFF/GIF), a **PDF**, or an **Office "
-        "document** (Word/PowerPoint/Excel/text/RTF/CSV) — Office files and PDFs are "
-        f"parsed page-by-page, capped at the first **{MAX_DEMO_PAGES} pages** to keep "
-        "runs inside a shared ZeroGPU quota."
-    )
+# `@spaces.GPU` doesn't stack with `@app.api` on the same function, so
+# `_run_document_gpu` (decorated above) does the GPU work and this thin
+# wrapper is what's actually exposed as an endpoint — see gr.Server docs.
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=4):
-            with gr.Group():
-                file_input = gr.File(
-                    label="Document",
-                    file_types=SUPPORTED_FILE_TYPES,
-                    type="filepath",
-                )
-                with gr.Row():
-                    mode = gr.Radio(
-                        list(MODES.keys()),
-                        value="Gundam — fast",
-                        label="Mode",
-                        info=MODE_INFO,
-                    )
-                prompt_preset = gr.Dropdown(
-                    list(PROMPT_PRESETS.keys()),
-                    value="Document parsing",
-                    label="Task",
-                    info="Pick a preset, or write your own prompt below.",
-                )
-                with gr.Accordion("Custom prompt (optional)", open=False):
-                    custom_prompt = gr.Textbox(
-                        label="Custom prompt",
-                        placeholder="e.g. Extract the table as markdown.",
-                        show_label=False,
-                    )
-            run_btn = gr.Button("▶  Run OCR", variant="primary", size="lg")
-            gr.Examples(
-                examples=EXAMPLES_SINGLE,
-                inputs=[file_input, mode, prompt_preset],
-                label="Try an example",
-                cache_examples=False,
-            )
+app.mount("/_next", StaticFiles(directory=os.path.join(STATIC_DIR, "_next")), name="next-assets")
+app.mount("/examples", StaticFiles(directory=os.path.join(STATIC_DIR, "examples")), name="examples")
 
-        with gr.Column(scale=5):
-            with gr.Group(elem_classes=["result-panel"]):
-                with gr.Tabs():
-                    with gr.Tab("Rendered"):
-                        output_md = gr.Markdown(
-                            value="*Results will appear here once you run OCR.*",
-                            min_height=280,
-                        )
-                    with gr.Tab("Raw text"):
-                        output_raw = gr.Textbox(
-                            show_label=False,
-                            lines=14,
-                            max_lines=30,
-                            buttons=["copy"],
-                        )
-                with gr.Accordion("🗺️ Layout grounding (detected regions)", open=False):
-                    output_boxes = gr.Gallery(
-                        show_label=False,
-                        columns=2,
-                        object_fit="contain",
-                        height=280,
-                    )
-            gr.Markdown(
-                "💡 **Tips**\n"
-                "- **Gundam** mode is fastest for single- or dual-column pages.\n"
-                "- **Base** mode helps on dense multi-column layouts or small text.\n"
-                "- Pick **Layout grounding** as the task to see detected regions "
-                "drawn on the page.\n"
-                "- PDFs/Office files with more than one resulting page always use "
-                "multi-page parsing, regardless of Mode."
-            )
 
-    run_btn.click(
-        run_document,
-        inputs=[file_input, mode, prompt_preset, custom_prompt],
-        outputs=[output_md, output_raw, output_boxes],
-    )
+@app.get("/favicon.ico")
+async def favicon():
+    return FileResponse(os.path.join(STATIC_DIR, "favicon.ico"))
 
-    gr.HTML(FOOTER_HTML)
 
-demo.queue().launch(theme=THEME, css=CSS, mcp_server=True)
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    with open(os.path.join(STATIC_DIR, "index.html"), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+demo = app  # HF runtime expects `demo`
+demo.launch()

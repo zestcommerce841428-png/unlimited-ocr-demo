@@ -4,3 +4,15 @@ __pycache__/
 venv/
 .DS_Store
 *.egg-info/
+
+# Frontend: only source is committed — build output is produced fresh by CI
+# and pushed straight to the HF Space, never committed here.
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+
+# static/ is the built frontend output staged for `hf upload`, assembled by
+# the deploy workflow (or manually) — not committed, same reasoning as above.
+/static/
