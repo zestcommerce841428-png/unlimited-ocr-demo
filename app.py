@@ -208,12 +208,16 @@ def _run_streaming(target_fn, **kwargs):
 
 
 def _document_duration(file, mode_label, prompt_preset, custom_prompt):
+    # ZeroGPU appears to apply its own safety margin on top of whatever is
+    # returned here before checking it against the visitor's tier cap (a
+    # 280s return was rejected as "420s" — a suspiciously exact 1.5x), so
+    # these are kept well under the free-tier per-call ceiling.
     if not file:
         return 60
     ext = os.path.splitext(file)[1].lower()
     if ext in IMAGE_EXTS:
-        return 60 if mode_label.startswith("Gundam") else 150
-    return 280  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
+        return 60 if mode_label.startswith("Gundam") else 120
+    return 150  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
 
 
 @spaces.GPU(duration=_document_duration)
