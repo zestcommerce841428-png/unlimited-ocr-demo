@@ -16,8 +16,10 @@ subprocess.run(
     check=True,
 )
 
+import glob
 import os
 import queue
+import shutil
 import tempfile
 import threading
 
@@ -49,7 +51,7 @@ MODES = {
     "Gundam — fast": dict(base_size=1024, image_size=640, crop_mode=True),
     "Base — accurate": dict(base_size=1024, image_size=1024, crop_mode=False),
 }
-MODE_INFO = "Gundam crops the page into tiles for speed. Base processes the full page for the highest fidelity."
+MODE_INFO = "Applies to single-page results. Gundam crops the page into tiles for speed; Base processes the full page for the highest fidelity."
 
 PROMPT_PRESETS = {
     "Document parsing": "document parsing.",
@@ -60,18 +62,92 @@ PROMPT_PRESETS = {
 
 MAX_DEMO_PAGES = 4  # keep multi-page runs inside a shared ZeroGPU quota
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
+OFFICE_EXTS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".odt", ".odp", ".ods", ".rtf", ".txt", ".csv"}
+PDF_EXT = ".pdf"
+
+SUPPORTED_FILE_TYPES = [
+    "image",
+    PDF_EXT,
+    *sorted(OFFICE_EXTS),
+]
+
+
+# ── File → page-image conversion ────────────────────────────────────────────────
+
+def _pdf_to_images(pdf_path: str, dpi: int = 200, max_pages: int = MAX_DEMO_PAGES):
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(pdf_path)
+    tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    paths = []
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        out = os.path.join(tmp_dir, f"page_{i + 1:04d}.png")
+        page.get_pixmap(matrix=mat).save(out)
+        paths.append(out)
+    doc.close()
+    return paths
+
+
+def _office_to_pdf(path: str) -> str:
+    """Converts an Office/text document to PDF with headless LibreOffice."""
+    if shutil.which("soffice") is None:
+        raise gr.Error(
+            "This file type needs LibreOffice for conversion, which isn't installed on this Space."
+        )
+    out_dir = tempfile.mkdtemp(prefix="office2pdf_")
+    try:
+        subprocess.run(
+            ["soffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", out_dir, path],
+            check=True,
+            timeout=180,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise gr.Error(f"Could not convert that file to PDF: {exc}")
+    except subprocess.TimeoutExpired:
+        raise gr.Error("Converting that file to PDF took too long.")
+
+    stem = os.path.splitext(os.path.basename(path))[0]
+    pdf_path = os.path.join(out_dir, f"{stem}.pdf")
+    if not os.path.exists(pdf_path):
+        raise gr.Error("Could not convert that file to PDF for parsing.")
+    return pdf_path
+
+
+def _file_to_pages(path: str, max_pages: int = MAX_DEMO_PAGES):
+    """Turns any supported upload into a list of page-image paths."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXTS:
+        return [path]
+    if ext == PDF_EXT:
+        return _pdf_to_images(path, max_pages=max_pages)
+    if ext in OFFICE_EXTS:
+        return _pdf_to_images(_office_to_pdf(path), max_pages=max_pages)
+    raise gr.Error(
+        f"Unsupported file type '{ext or '(none)'}'. Supported: images, PDF, "
+        "and Office documents (Word/PowerPoint/Excel/text)."
+    )
+
 
 # ── Inference helpers ─────────────────────────────────────────────────────────
 
-def _read_result(out_dir: str):
+def _read_result_text(out_dir: str) -> str:
     md_path = os.path.join(out_dir, "result.md")
-    text = ""
     if os.path.exists(md_path):
         with open(md_path, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-    boxes_path = os.path.join(out_dir, "result_with_boxes.jpg")
-    boxes_image = boxes_path if os.path.exists(boxes_path) else None
-    return text, boxes_image
+            return f.read().strip()
+    return ""
+
+
+def _collect_boxes_images(out_dir: str):
+    single = os.path.join(out_dir, "result_with_boxes.jpg")
+    if os.path.exists(single):
+        return [single]
+    return sorted(glob.glob(os.path.join(out_dir, "result_with_boxes_*.jpg")))
 
 
 class _StreamTap:
@@ -131,93 +207,64 @@ def _run_streaming(target_fn, **kwargs):
     yield accumulated
 
 
-def _single_duration(image, mode_label, prompt_preset, custom_prompt):
-    return 60 if mode_label.startswith("Gundam") else 150
+def _document_duration(file, mode_label, prompt_preset, custom_prompt):
+    if not file:
+        return 60
+    ext = os.path.splitext(file)[1].lower()
+    if ext in IMAGE_EXTS:
+        return 60 if mode_label.startswith("Gundam") else 150
+    return 280  # PDF / Office: conversion + up to MAX_DEMO_PAGES pages
 
 
-@spaces.GPU(duration=_single_duration)
-def run_ocr(image, mode_label, prompt_preset, custom_prompt):
-    """Parse one document/image page with Unlimited-OCR and stream the Markdown result."""
-    if image is None:
-        raise gr.Error("Upload an image first.")
+@spaces.GPU(duration=_document_duration)
+def run_document(file, mode_label, prompt_preset, custom_prompt):
+    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR."""
+    if not file:
+        raise gr.Error("Upload a file first.")
 
-    prompt = (custom_prompt or "").strip() or PROMPT_PRESETS[prompt_preset]
+    pages = _file_to_pages(file)
+    if not pages:
+        raise gr.Error("Could not read any pages from that file.")
+
+    prompt = (custom_prompt or "").strip()
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
 
-    infer_kwargs = dict(
-        prompt=f"<image>{prompt}",
-        image_file=image,
-        output_path=out_dir,
-        max_length=8192,
-        no_repeat_ngram_size=35,
-        ngram_window=128,
-        save_results=True,
-        **MODES[mode_label],
-    )
+    if len(pages) == 1:
+        prompt = prompt or PROMPT_PRESETS[prompt_preset]
+        infer_kwargs = dict(
+            prompt=f"<image>{prompt}",
+            image_file=pages[0],
+            output_path=out_dir,
+            max_length=8192,
+            no_repeat_ngram_size=35,
+            ngram_window=128,
+            save_results=True,
+            **MODES[mode_label],
+        )
+        target_fn = model.infer
+    else:
+        if not prompt:
+            prompt = "Multi page parsing." if prompt_preset == "Document parsing" else PROMPT_PRESETS[prompt_preset]
+        infer_kwargs = dict(
+            prompt=f"<image>{prompt}",
+            image_files=pages,
+            output_path=out_dir,
+            image_size=1024,
+            max_length=6144,
+            no_repeat_ngram_size=35,
+            ngram_window=512,
+            save_results=True,
+        )
+        target_fn = model.infer_multi
 
     final_text = ""
-    for accumulated in _run_streaming(model.infer, **infer_kwargs):
+    for accumulated in _run_streaming(target_fn, **infer_kwargs):
         final_text = accumulated
         yield accumulated, accumulated, None
 
-    text, boxes_image = _read_result(out_dir)
-    final_text = text or final_text
-    yield final_text, final_text, boxes_image
-
-
-def _pdf_to_images(pdf_path: str, dpi: int = 200, max_pages: int = MAX_DEMO_PAGES):
-    import fitz  # PyMuPDF
-
-    doc = fitz.open(pdf_path)
-    tmp_dir = tempfile.mkdtemp(prefix="pdf_ocr_")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    paths = []
-    for i, page in enumerate(doc):
-        if i >= max_pages:
-            break
-        out = os.path.join(tmp_dir, f"page_{i + 1:04d}.png")
-        page.get_pixmap(matrix=mat).save(out)
-        paths.append(out)
-    doc.close()
-    return paths
-
-
-def _pdf_duration(pdf_file, custom_prompt):
-    return 240
-
-
-@spaces.GPU(duration=_pdf_duration)
-def run_ocr_pdf(pdf_file, custom_prompt):
-    """Parse the first pages of a PDF in one shot with Unlimited-OCR's multi-page mode."""
-    if pdf_file is None:
-        raise gr.Error("Upload a PDF first.")
-
-    pages = _pdf_to_images(pdf_file)
-    if not pages:
-        raise gr.Error("Could not read any pages from that PDF.")
-
-    prompt = (custom_prompt or "").strip() or "Multi page parsing."
-    out_dir = tempfile.mkdtemp(prefix="ocr_out_multi_")
-
-    infer_kwargs = dict(
-        prompt=f"<image>{prompt}",
-        image_files=pages,
-        output_path=out_dir,
-        image_size=1024,
-        max_length=6144,
-        no_repeat_ngram_size=35,
-        ngram_window=512,
-        save_results=True,
-    )
-
-    final_text = ""
-    for accumulated in _run_streaming(model.infer_multi, **infer_kwargs):
-        final_text = accumulated
-        yield accumulated, accumulated
-
-    text, _ = _read_result(out_dir)
-    final_text = text or final_text
-    yield final_text, final_text
+    text = _read_result_text(out_dir) or final_text
+    boxes = _collect_boxes_images(out_dir)
+    yield text, text, (boxes or None)
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -283,105 +330,85 @@ EXAMPLES_SINGLE = [
 
 with gr.Blocks(title="Unlimited-OCR Demo") as demo:
     gr.HTML(HERO_HTML)
+    gr.Markdown(
+        f"Upload an **image** (JPG/PNG/WEBP/BMP/TIFF/GIF), a **PDF**, or an **Office "
+        "document** (Word/PowerPoint/Excel/text/RTF/CSV) — Office files and PDFs are "
+        f"parsed page-by-page, capped at the first **{MAX_DEMO_PAGES} pages** to keep "
+        "runs inside a shared ZeroGPU quota."
+    )
 
-    with gr.Tabs():
-        with gr.Tab("📄 Single image"):
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=4):
-                    with gr.Group():
-                        image_input = gr.Image(label="Document image", type="filepath", height=320)
-                        with gr.Row():
-                            mode = gr.Radio(
-                                list(MODES.keys()),
-                                value="Gundam — fast",
-                                label="Mode",
-                                info=MODE_INFO,
-                            )
-                        prompt_preset = gr.Dropdown(
-                            list(PROMPT_PRESETS.keys()),
-                            value="Document parsing",
-                            label="Task",
-                            info="Pick a preset, or write your own prompt below.",
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=4):
+            with gr.Group():
+                file_input = gr.File(
+                    label="Document",
+                    file_types=SUPPORTED_FILE_TYPES,
+                    type="filepath",
+                )
+                with gr.Row():
+                    mode = gr.Radio(
+                        list(MODES.keys()),
+                        value="Gundam — fast",
+                        label="Mode",
+                        info=MODE_INFO,
+                    )
+                prompt_preset = gr.Dropdown(
+                    list(PROMPT_PRESETS.keys()),
+                    value="Document parsing",
+                    label="Task",
+                    info="Pick a preset, or write your own prompt below.",
+                )
+                with gr.Accordion("Custom prompt (optional)", open=False):
+                    custom_prompt = gr.Textbox(
+                        label="Custom prompt",
+                        placeholder="e.g. Extract the table as markdown.",
+                        show_label=False,
+                    )
+            run_btn = gr.Button("▶  Run OCR", variant="primary", size="lg")
+            gr.Examples(
+                examples=EXAMPLES_SINGLE,
+                inputs=[file_input, mode, prompt_preset],
+                label="Try an example",
+                cache_examples=False,
+            )
+
+        with gr.Column(scale=5):
+            with gr.Group(elem_classes=["result-panel"]):
+                with gr.Tabs():
+                    with gr.Tab("Rendered"):
+                        output_md = gr.Markdown(
+                            value="*Results will appear here once you run OCR.*",
+                            min_height=280,
                         )
-                        with gr.Accordion("Custom prompt (optional)", open=False):
-                            custom_prompt = gr.Textbox(
-                                label="Custom prompt",
-                                placeholder="e.g. Extract the table as markdown.",
-                                show_label=False,
-                            )
-                    run_btn = gr.Button("▶  Run OCR", variant="primary", size="lg")
-                    gr.Examples(
-                        examples=EXAMPLES_SINGLE,
-                        inputs=[image_input, mode, prompt_preset],
-                        label="Try an example",
-                        cache_examples=False,
+                    with gr.Tab("Raw text"):
+                        output_raw = gr.Textbox(
+                            show_label=False,
+                            lines=14,
+                            max_lines=30,
+                            buttons=["copy"],
+                        )
+                with gr.Accordion("🗺️ Layout grounding (detected regions)", open=False):
+                    output_boxes = gr.Gallery(
+                        show_label=False,
+                        columns=2,
+                        object_fit="contain",
+                        height=280,
                     )
-
-                with gr.Column(scale=5):
-                    with gr.Group(elem_classes=["result-panel"]):
-                        with gr.Tabs():
-                            with gr.Tab("Rendered"):
-                                output_md = gr.Markdown(
-                                    value="*Results will appear here once you run OCR.*",
-                                    min_height=280,
-                                )
-                            with gr.Tab("Raw text"):
-                                output_raw = gr.Textbox(
-                                    show_label=False,
-                                    lines=14,
-                                    max_lines=30,
-                                    buttons=["copy"],
-                                )
-                        with gr.Accordion("🗺️ Layout grounding (detected regions)", open=False):
-                            output_boxes = gr.Image(show_label=False, type="filepath")
-                    gr.Markdown(
-                        "💡 **Tips**\n"
-                        "- **Gundam** mode is fastest for single- or dual-column pages.\n"
-                        "- **Base** mode helps on dense multi-column layouts or small text.\n"
-                        "- Pick **Layout grounding** as the task to see detected regions "
-                        "drawn on the page."
-                    )
-
-            run_btn.click(
-                run_ocr,
-                inputs=[image_input, mode, prompt_preset, custom_prompt],
-                outputs=[output_md, output_raw, output_boxes],
-            )
-
-        with gr.Tab("📚 Multi-page PDF"):
             gr.Markdown(
-                f"Demo caps multi-page parsing at the first **{MAX_DEMO_PAGES} pages** to keep runs "
-                "inside a shared ZeroGPU quota. For full-length documents, call "
-                "`model.infer_multi(...)` directly — see the "
-                f"[model card](https://huggingface.co/{MODEL_NAME})."
+                "💡 **Tips**\n"
+                "- **Gundam** mode is fastest for single- or dual-column pages.\n"
+                "- **Base** mode helps on dense multi-column layouts or small text.\n"
+                "- Pick **Layout grounding** as the task to see detected regions "
+                "drawn on the page.\n"
+                "- PDFs/Office files with more than one resulting page always use "
+                "multi-page parsing, regardless of Mode."
             )
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=4):
-                    with gr.Group():
-                        pdf_input = gr.File(label="PDF file", file_types=[".pdf"], type="filepath")
-                        pdf_prompt = gr.Textbox(label="Prompt", value="Multi page parsing.")
-                    pdf_btn = gr.Button("▶  Parse PDF", variant="primary", size="lg")
-                with gr.Column(scale=5):
-                    with gr.Group(elem_classes=["result-panel"]):
-                        with gr.Tabs():
-                            with gr.Tab("Rendered"):
-                                pdf_output_md = gr.Markdown(
-                                    value="*Results will appear here once you run OCR.*",
-                                    min_height=280,
-                                )
-                            with gr.Tab("Raw text"):
-                                pdf_output_raw = gr.Textbox(
-                                    show_label=False,
-                                    lines=14,
-                                    max_lines=30,
-                                    buttons=["copy"],
-                                )
 
-            pdf_btn.click(
-                run_ocr_pdf,
-                inputs=[pdf_input, pdf_prompt],
-                outputs=[pdf_output_md, pdf_output_raw],
-            )
+    run_btn.click(
+        run_document,
+        inputs=[file_input, mode, prompt_preset, custom_prompt],
+        outputs=[output_md, output_raw, output_boxes],
+    )
 
     gr.HTML(FOOTER_HTML)
 

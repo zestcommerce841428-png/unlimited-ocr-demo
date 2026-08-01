@@ -14,11 +14,16 @@ long-horizon document parsing to Markdown, with layout grounding boxes. Deployed
 
 ## Features
 
-- **Single-image parsing** — upload a document page and parse it straight to Markdown
+- **Upload almost anything** — images (JPG/PNG/WEBP/BMP/TIFF/GIF), PDFs, and Office
+  documents (Word/PowerPoint/Excel/RTF/text/CSV, converted to PDF with headless
+  LibreOffice) all go through one uploader
+- **Automatic single- vs. multi-page routing** — a single resulting page uses
+  `model.infer(...)`; a PDF/Office file that expands to more than one page
+  automatically uses `model.infer_multi(...)`, capped at the first few pages to
+  keep runs inside a shared ZeroGPU quota
 - **Two speed/accuracy modes** — *Gundam* (crops the page, fast) and *Base* (full page, most accurate)
 - **Task presets** — document parsing, free OCR, figure parsing, and layout grounding, or write your own prompt
-- **Layout grounding** — view detected regions drawn directly on the page
-- **Multi-page PDF parsing** — one-shot parsing across the first few pages of a PDF via `model.infer_multi`
+- **Layout grounding** — view detected regions drawn directly on the page (a gallery for multi-page results)
 - **Streaming output** — tokens render into the UI as the model generates them
 - **Example gallery** — try it instantly with two bundled synthetic sample documents
 
@@ -42,6 +47,10 @@ python app.py
 
 The app will be available at `http://127.0.0.1:7860`.
 
+Parsing Office documents (`.docx`, `.pptx`, `.xlsx`, `.rtf`, `.txt`, `.csv`) also
+requires `soffice` (LibreOffice) on `PATH` for the headless doc-to-PDF conversion —
+see `packages.txt` for what's installed on the Space. Images and PDFs work without it.
+
 > **Note:** `transformers==4.57.1` is intentionally installed at runtime inside
 > `app.py` rather than pinned in `requirements.txt` — see the comment at the top of
 > the file for why (a real version conflict between what `transformers` and the
@@ -59,8 +68,9 @@ on-demand GPU worker. This is exactly how the [live demo](https://huggingface.co
 
 ```
 .
-├── app.py            # Gradio app: UI, streaming inference, PDF handling
-├── requirements.txt  # Build-time dependencies (transformers installed at runtime)
+├── app.py            # Gradio app: UI, streaming inference, file-type routing
+├── requirements.txt  # Build-time Python dependencies (transformers installed at runtime)
+├── packages.txt      # Build-time apt dependency: libreoffice (Office → PDF conversion)
 ├── examples/          # Synthetic sample documents used by the example gallery
 ├── LICENSE
 └── README.md
@@ -74,8 +84,11 @@ on-demand GPU worker. This is exactly how the [live demo](https://huggingface.co
 - **Streaming** — Unlimited-OCR's `TextStreamer` prints generated tokens straight to
   `stdout` rather than exposing an iterator, so `app.py` runs inference in a background
   thread and taps `stdout` to stream partial output into the Gradio UI.
-- **Single image** uses `model.infer(...)`; **multi-page PDF** uses `model.infer_multi(...)`
-  after converting pages to images with PyMuPDF — both documented in the
+- **File-type routing** — images are used directly; PDFs are rasterized to page images
+  with PyMuPDF; Office/text documents are first converted to PDF with headless
+  LibreOffice (`soffice --headless --convert-to pdf`), then rasterized the same way.
+  A single resulting page uses `model.infer(...)`; more than one uses
+  `model.infer_multi(...)` — both documented in the
   [model card](https://huggingface.co/baidu/Unlimited-OCR).
 
 ## Deploying your own copy
