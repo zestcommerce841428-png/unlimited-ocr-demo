@@ -20,9 +20,11 @@ import base64
 import glob
 import os
 import queue
+import re
 import shutil
 import tempfile
 import threading
+import time
 from typing import Iterator
 
 import spaces  # noqa: E402  (must precede torch / transformers imports)
@@ -174,22 +176,34 @@ def _collect_boxes_data_urls(out_dir: str):
     return urls
 
 
+_TPS_RE = re.compile(r"\[TPS\]\s*tokens=(\d+),\s*recent=([\d.]+)\s*t/s,\s*avg=([\d.]+)\s*t/s")
+
+
 class _StreamTap:
     """Mirrors stdout to a queue, but only lines written by `target_thread`.
 
     Unlimited-OCR's TextStreamer prints generated tokens straight to stdout
     (transformers.TextStreamer.on_finalized_text) instead of returning an
     iterator, so this is the only way to stream partial output to the UI.
+    `[TPS] ...` lines (emitted when `tps_interval > 0`) are parsed into
+    `stats` in place rather than mixed into the visible text.
     """
 
-    def __init__(self, target_thread: threading.Thread, sink: "queue.Queue[str]", real_stdout):
+    def __init__(self, target_thread: threading.Thread, sink: "queue.Queue[str]", real_stdout, stats: dict):
         self.target_thread = target_thread
         self.sink = sink
         self.real_stdout = real_stdout
+        self.stats = stats
 
     def write(self, data: str) -> int:
         self.real_stdout.write(data)
-        if data and threading.current_thread() is self.target_thread and "[tps]" not in data.lower():
+        if data and threading.current_thread() is self.target_thread:
+            m = _TPS_RE.search(data)
+            if m:
+                self.stats["tokens"] = int(m.group(1))
+                self.stats["recent_tps"] = float(m.group(2))
+                self.stats["avg_tps"] = float(m.group(3))
+                return len(data)
             self.sink.put(data)
         return len(data)
 
@@ -198,9 +212,11 @@ class _StreamTap:
 
 
 def _run_streaming(target_fn, **kwargs):
-    """Runs `target_fn(tokenizer, **kwargs)` in a thread, yielding accumulated stdout text."""
+    """Runs `target_fn(tokenizer, **kwargs)` in a thread, yielding (accumulated_text, stats)."""
     chunks: "queue.Queue[str]" = queue.Queue()
     errors = []
+    stats = {"tokens": 0, "recent_tps": 0.0, "avg_tps": 0.0}
+    start = time.perf_counter()
 
     def _worker():
         try:
@@ -210,7 +226,7 @@ def _run_streaming(target_fn, **kwargs):
 
     thread = threading.Thread(target=_worker, daemon=True)
     real_stdout = sys.stdout
-    sys.stdout = _StreamTap(thread, chunks, real_stdout)
+    sys.stdout = _StreamTap(thread, chunks, real_stdout, stats)
 
     accumulated = ""
     try:
@@ -221,17 +237,17 @@ def _run_streaming(target_fn, **kwargs):
             except queue.Empty:
                 continue
             accumulated += piece
-            yield accumulated
+            yield accumulated, {**stats, "elapsed": round(time.perf_counter() - start, 1), "chars": len(accumulated)}
     finally:
         sys.stdout = real_stdout
         thread.join()
 
     if errors:
         raise gr.Error(f"Inference failed: {errors[0]}")
-    yield accumulated
+    yield accumulated, {**stats, "elapsed": round(time.perf_counter() - start, 1), "chars": len(accumulated)}
 
 
-def _document_duration(document, mode, prompt):
+def _document_duration(documents, mode, prompt):
     # ZeroGPU appears to apply its own safety margin on top of whatever is
     # returned here before checking it against the visitor's tier cap (a
     # 280s return was rejected as "420s" — a suspiciously exact 1.5x), so
@@ -240,6 +256,11 @@ def _document_duration(document, mode, prompt):
     # that may not preserve the extension) to detect the file type, and
     # never let a detection quirk request an oversized duration.
     try:
+        if not documents:
+            return 45
+        if len(documents) > 1:
+            return 110  # combining multiple files always takes the multi-page path
+        document = documents[0]
         name = ""
         if isinstance(document, dict):
             name = document.get("orig_name") or document.get("path") or ""
@@ -267,20 +288,30 @@ app = Server(title="Unlimited-OCR Demo")
 # actually works here.
 @app.api(name="run_document", stream_every=0.15, time_limit=200)
 @spaces.GPU(duration=_document_duration)
-def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "") -> Iterator[dict]:
-    """Parse an uploaded document (image, PDF, or Office file) with Unlimited-OCR.
+def run_document_api(documents: list[FileData], mode: str = "gundam", prompt: str = "") -> Iterator[dict]:
+    """Parse one or more uploaded documents (images, PDFs, or Office files) with Unlimited-OCR.
 
     Args:
-        document: the uploaded file — an image, PDF, or Office document.
+        documents: one or more uploaded files. Multiple files are combined
+            into a single multi-page document, each contributing its own
+            page(s) in upload order (e.g. several photographed pages of the
+            same physical document).
         mode: 'gundam' (fast, crops the page) or 'base' (accurate, full page).
-            Only affects single-page results.
+            Only affects results that end up as a single page.
         prompt: OCR instruction, e.g. 'document parsing.', 'Free OCR.', or a
             custom prompt. Empty defaults to document parsing.
     """
-    path = _normalize_upload_path(document)
-    pages = _file_to_pages(path)
+    if not documents:
+        raise gr.Error("Upload at least one file.")
+
+    pages = []
+    for doc in documents:
+        if len(pages) >= MAX_DEMO_PAGES:
+            break
+        path = _normalize_upload_path(doc)
+        pages.extend(_file_to_pages(path, max_pages=MAX_DEMO_PAGES - len(pages)))
     if not pages:
-        raise gr.Error("Could not read any pages from that file.")
+        raise gr.Error("Could not read any pages from the uploaded file(s).")
 
     prompt = (prompt or "").strip()
     out_dir = tempfile.mkdtemp(prefix="ocr_out_")
@@ -294,6 +325,7 @@ def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "")
             max_length=8192,
             no_repeat_ngram_size=35,
             ngram_window=128,
+            tps_interval=12,
             save_results=True,
             **MODES.get(mode, MODES["gundam"]),
         )
@@ -308,17 +340,31 @@ def run_document_api(document: FileData, mode: str = "gundam", prompt: str = "")
             max_length=6144,
             no_repeat_ngram_size=35,
             ngram_window=512,
+            tps_interval=12,
             save_results=True,
         )
         target_fn = model.infer_multi
 
     final_text = ""
-    for accumulated in _run_streaming(target_fn, **infer_kwargs):
+    final_stats = {}
+    for accumulated, stats in _run_streaming(target_fn, **infer_kwargs):
         final_text = accumulated
-        yield {"text": accumulated, "boxes": []}
+        final_stats = stats
+        yield {"text": accumulated, "raw_text": accumulated, "boxes": [], "stats": stats, "page_count": len(pages)}
 
     text = _read_result_text(out_dir) or final_text
-    yield {"text": text, "boxes": _collect_boxes_data_urls(out_dir)}
+    yield {
+        "text": text,
+        "raw_text": final_text,
+        "boxes": _collect_boxes_data_urls(out_dir),
+        "stats": final_stats,
+        "page_count": len(pages),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": MODEL_NAME}
 
 
 app.mount("/_next", StaticFiles(directory=os.path.join(STATIC_DIR, "_next")), name="next-assets")

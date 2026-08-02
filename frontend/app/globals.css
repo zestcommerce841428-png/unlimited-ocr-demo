@@ -15,8 +15,12 @@
   --ring: #93c5fd;
 }
 
+/* Dark palette applies when the OS prefers dark (unless overridden by an
+   explicit .light class) OR when JS has set an explicit .dark class — see
+   ThemeProvider. Keeping both the media query and the class selector means
+   "system" mode works before JS hydrates, and manual light/dark override it. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not(.light) {
     --background: #0b1120;
     --surface: #131c2e;
     --surface-muted: #1b2740;
@@ -29,6 +33,19 @@
     --accent: #818cf8;
     --ring: #1d4ed8;
   }
+}
+:root.dark {
+  --background: #0b1120;
+  --surface: #131c2e;
+  --surface-muted: #1b2740;
+  --foreground: #e2e8f0;
+  --foreground-muted: #94a3b8;
+  --border: #263349;
+  --primary: #3b82f6;
+  --primary-hover: #60a5fa;
+  --primary-foreground: #0b1120;
+  --accent: #818cf8;
+  --ring: #1d4ed8;
 }
 
 @theme inline {
@@ -87,4 +104,34 @@ body {
 }
 .animate-pulse-dot {
   animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-toast-in {
+  animation: toast-in 0.18s ease-out;
+}
+
+.grounding-region {
+  position: absolute;
+  border: 2px solid var(--region-color, var(--color-primary));
+  background: color-mix(in srgb, var(--region-color, var(--color-primary)) 15%, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+.grounding-region.active {
+  background: color-mix(in srgb, var(--region-color, var(--color-primary)) 35%, transparent);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-primary) 30%, transparent);
 }

@@ -27,6 +27,7 @@ export const TASK_PRESETS = [
 export type TaskKey = (typeof TASK_PRESETS)[number]["key"];
 
 export const MAX_DEMO_PAGES = 4;
+export const MAX_FILE_SIZE_MB = 25;
 
 export const SUPPORTED_EXTENSIONS = [
   ".png",
